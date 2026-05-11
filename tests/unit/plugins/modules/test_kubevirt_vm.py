@@ -159,6 +159,7 @@ MODULE_PARAMS_DEFAULT = {
     "state": "present",
     "force": False,
     "delete_options": None,
+    "grace_period_seconds": None,
 }
 
 MODULE_PARAMS_CREATE = MODULE_PARAMS_DEFAULT | {
@@ -711,3 +712,89 @@ def test_set_wait_condition(mocker, params, expected):
     kubevirt_vm.set_wait_condition(module)
 
     assert module.params == params | expected
+
+
+MODULE_PARAMS_RESTART = MODULE_PARAMS_DEFAULT | {
+    "name": "testvm",
+    "namespace": "default",
+    "state": "restart",
+    "grace_period_seconds": None,
+}
+
+MODULE_PARAMS_RESTART_FORCE = MODULE_PARAMS_DEFAULT | {
+    "name": "testvm",
+    "namespace": "default",
+    "state": "restart",
+    "grace_period_seconds": 0,
+}
+
+RESTART_PATH = f"/apis/{kubevirt_vm.RESTART_SUBRESOURCE_API}/namespaces/default/virtualmachines/testvm/restart"
+
+
+@pytest.mark.parametrize(
+    "module_params,expected_body",
+    [
+        (MODULE_PARAMS_RESTART, None),
+        (MODULE_PARAMS_RESTART_FORCE, {"gracePeriodSeconds": 0}),
+    ],
+)
+def test_restart_vm(mocker, module_params, expected_body):
+    mocker.patch.object(AnsibleModule, "exit_json", exit_json)
+    mocker.patch.object(runner, "get_api_client")
+
+    mock_client = mocker.Mock()
+    mocker.patch.object(kubevirt_vm, "get_api_client", return_value=mock_client)
+
+    with pytest.raises(AnsibleExitJson) as exc, patch_module_args(module_params):
+        kubevirt_vm.main()
+
+    mock_client.client.request.assert_called_once_with(
+        "put",
+        RESTART_PATH,
+        body=expected_body,
+        header_params={"Accept": "*/*"},
+    )
+    assert exc.value.args[0]["changed"] is True
+
+
+def test_restart_vm_check_mode(mocker):
+    mocker.patch.object(AnsibleModule, "exit_json", exit_json)
+    mocker.patch.object(runner, "get_api_client")
+
+    mock_get_api_client = mocker.patch.object(kubevirt_vm, "get_api_client")
+
+    params = MODULE_PARAMS_RESTART | {"_ansible_check_mode": True}
+    with pytest.raises(AnsibleExitJson) as exc, patch_module_args(params):
+        kubevirt_vm.main()
+
+    mock_get_api_client.assert_not_called()
+    assert exc.value.args[0]["changed"] is True
+
+
+def test_restart_vm_fails_without_name(mocker):
+    mocker.patch.object(AnsibleModule, "fail_json", fail_json)
+
+    params = MODULE_PARAMS_DEFAULT | {
+        "namespace": "default",
+        "state": "restart",
+        "generate_name": "testvm-",
+    }
+    with pytest.raises(AnsibleFailJson), patch_module_args(params):
+        kubevirt_vm.main()
+
+
+def test_restart_vm_api_error(mocker):
+    mocker.patch.object(AnsibleModule, "exit_json", exit_json)
+    mocker.patch.object(AnsibleModule, "fail_json", fail_json)
+    mocker.patch.object(runner, "get_api_client")
+
+    mock_client = mocker.Mock()
+    mock_client.client.request.side_effect = Exception("API error")
+    mocker.patch.object(kubevirt_vm, "get_api_client", return_value=mock_client)
+
+    with pytest.raises(AnsibleFailJson) as exc, patch_module_args(
+        MODULE_PARAMS_RESTART
+    ):
+        kubevirt_vm.main()
+
+    assert "Failed to restart VirtualMachine" in exc.value.args[0]["msg"]

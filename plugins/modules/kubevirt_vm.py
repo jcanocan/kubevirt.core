@@ -11,13 +11,13 @@ __metaclass__ = type
 DOCUMENTATION = """
 module: kubevirt_vm
 
-short_description: Create or delete KubeVirt VirtualMachines
+short_description: Create, delete, or restart KubeVirt VirtualMachines
 
 author:
 - "KubeVirt.io Project (!UNKNOWN)"
 
 description:
-- Use the Kubernetes Python client to perform create or delete operations on KubeVirt VirtualMachines.
+- Use the Kubernetes Python client to perform create, delete, or restart operations on KubeVirt VirtualMachines.
 - Pass options to create the VirtualMachine as module arguments.
 - Authenticate using either a config file, certificates, password or token.
 - Supports check mode.
@@ -76,6 +76,12 @@ options:
     - RerunOnFailure
     - Once
     version_added: 2.0.0
+  grace_period_seconds:
+    description:
+    - Specify the grace period in seconds for restarting the C(VirtualMachine).
+    - Only used when O(state=restart).
+    - The only supported values are V(null) (use the default grace period) and V(0) (force restart immediately).
+    type: int
   instancetype:
     description:
     - Specify the C(Instancetype) matcher of the C(VirtualMachine).
@@ -144,15 +150,17 @@ options:
             type: str
   state:
     description:
-    - Determines if an object should be created, patched, or deleted.
+    - Determines if an object should be created, patched, deleted, or restarted.
     - When set to O(state=present), an object will be created, if it does not already exist.
     - If set to O(state=absent), an existing object will be deleted.
     - If set to O(state=present), an existing object will be patched, if its attributes differ from those specified.
+    - If set to O(state=restart), a running C(VirtualMachine) will be restarted.
     type: str
     default: present
     choices:
     - absent
     - present
+    - restart
   force:
     description:
     - If set to O(force=yes), and O(state=present) is set, an existing object will be replaced.
@@ -258,6 +266,21 @@ EXAMPLES = """
     name: testvm
     namespace: default
     state: absent
+
+- name: Restart a VirtualMachine
+  kubevirt.core.kubevirt_vm:
+    name: testvm
+    namespace: default
+    state: restart
+    wait: true
+
+- name: Force restart a VirtualMachine
+  kubevirt.core.kubevirt_vm:
+    name: testvm
+    namespace: default
+    state: restart
+    grace_period_seconds: 0
+    wait: true
 """
 
 RETURN = """
@@ -300,11 +323,17 @@ from ansible_collections.kubernetes.core.plugins.module_utils.args_common import
 from ansible_collections.kubernetes.core.plugins.module_utils.k8s import (
     runner,
 )
+from ansible_collections.kubernetes.core.plugins.module_utils.k8s.client import (
+    get_api_client,
+)
 from ansible_collections.kubernetes.core.plugins.module_utils.k8s.core import (
     AnsibleK8SModule,
 )
 from ansible_collections.kubernetes.core.plugins.module_utils.k8s.exceptions import (
     CoreException,
+)
+from ansible_collections.kubernetes.core.plugins.module_utils.k8s.service import (
+    K8sService,
 )
 
 WAIT_CONDITION_READY = {"type": "Ready", "status": True}
@@ -380,6 +409,62 @@ def set_wait_condition(module: AnsibleK8SModule) -> None:
         module.params["wait_condition"] = WAIT_CONDITION_READY
 
 
+RESTART_SUBRESOURCE_API = "subresources.kubevirt.io/v1"
+
+
+def restart_vm(module: AnsibleK8SModule) -> None:
+    """
+    restart_vm restarts a running VirtualMachine by calling the
+    KubeVirt restart subresource API.
+    """
+    name = module.params["name"]
+    namespace = module.params["namespace"]
+    grace_period_seconds = module.params.get("grace_period_seconds")
+
+    if module.check_mode:
+        module.exit_json(changed=True)
+
+    client = get_api_client(module)
+
+    path = (
+        f"/apis/{RESTART_SUBRESOURCE_API}"
+        f"/namespaces/{namespace}"
+        f"/virtualmachines/{name}/restart"
+    )
+
+    body = None
+    if grace_period_seconds is not None:
+        body = {"gracePeriodSeconds": grace_period_seconds}
+
+    try:
+        client.client.request("put", path, body=body, header_params={"Accept": "*/*"})
+    except Exception as exc:
+        module.fail_json(
+            msg=f"Failed to restart VirtualMachine '{name}': {exc}",
+        )
+
+    result = {"changed": True}
+
+    if module.params.get("wait"):
+        try:
+            svc = K8sService(client, module)
+            wait_result = svc.find(
+                kind="VirtualMachine",
+                api_version=module.params["api_version"],
+                name=name,
+                namespace=namespace,
+                wait=True,
+                wait_sleep=module.params["wait_sleep"],
+                wait_timeout=module.params["wait_timeout"],
+                condition=WAIT_CONDITION_READY,
+            )
+            result.update(wait_result)
+        except CoreException as exc:
+            module.fail_from_exception(exc)
+
+    module.exit_json(**result)
+
+
 def arg_spec() -> Dict:
     """
     arg_spec defines the argument spec of this module.
@@ -395,6 +480,7 @@ def arg_spec() -> Dict:
         "run_strategy": {
             "choices": ["Always", "Halted", "Manual", "RerunOnFailure", "Once"]
         },
+        "grace_period_seconds": {"type": "int"},
         "instancetype": {"type": "dict"},
         "preference": {"type": "dict"},
         "data_volume_templates": {"type": "list", "elements": "dict"},
@@ -430,6 +516,11 @@ def arg_spec() -> Dict:
     spec.update(deepcopy(AUTH_ARG_SPEC))
     spec.update(deepcopy(COMMON_ARG_SPEC))
 
+    spec["state"] = {
+        "default": "present",
+        "choices": ["absent", "present", "restart"],
+    }
+
     return spec
 
 
@@ -448,8 +539,15 @@ def main() -> None:
         required_one_of=[
             ("name", "generate_name"),
         ],
+        required_if=[
+            ("state", "restart", ("name",)),
+        ],
         supports_check_mode=True,
     )
+
+    if module.params["state"] == "restart":
+        restart_vm(module)
+        return
 
     # Set resource_definition to our constructed VM
     module.params["resource_definition"] = create_vm(module.params)
